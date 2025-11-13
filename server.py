@@ -113,7 +113,7 @@ def upload_pdf():
         
     except Exception as e:
         logger.error(f"Error processing PDF: {str(e)}", exc_info=True)
-        return jsonify({'error': f'Error processing PDF: {str(e)}'}), 500
+        return jsonify({'error': 'Error processing PDF. Please check the file and try again.'}), 500
 
 
 @app.route('/download/<filename>', methods=['GET'])
@@ -138,7 +138,7 @@ def download_file(filename):
         
     except Exception as e:
         logger.error(f"Error downloading file: {str(e)}", exc_info=True)
-        return jsonify({'error': f'Error downloading file: {str(e)}'}), 500
+        return jsonify({'error': 'Error downloading file. Please try again.'}), 500
 
 
 @app.route('/analyze', methods=['POST'])
@@ -183,7 +183,7 @@ def analyze_text():
         
     except Exception as e:
         logger.error(f"Error analyzing text: {str(e)}", exc_info=True)
-        return jsonify({'error': f'Error analyzing text: {str(e)}'}), 500
+        return jsonify({'error': 'Error analyzing text. Please check the input and try again.'}), 500
 
 
 if __name__ == '__main__':
