@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest test_providers.py -v)",
+      "Bash(pip install:*)",
+      "Bash(python -m pytest test_comparison.py -v)",
+      "Bash(python -m pytest test_providers.py test_comparison.py -v)",
+      "Bash(python -m pytest test_providers.py -v --tb=short)",
+      "Bash(python test_basic.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python -c \"from novelty_detector import NoveltyDetector; print\\(''import ok''\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 python -m unittest test_comparison -v)",
+      "Bash(python -m pytest test_providers.py test_comparison.py -v --tb=short)",
+      "Read(//c/Users/simon/AppData/Local/Temp/**)",
+      "Bash(find /tmp -name \"*ddytxx*\")",
+      "Bash(python -c \":*)"
+    ]
+  }
+}

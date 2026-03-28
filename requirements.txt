@@ -8,3 +8,4 @@ numpy==1.26.4
 sentence-transformers==5.1.2
 python-dotenv==1.0.0
 werkzeug==3.0.1
+requests>=2.31.0

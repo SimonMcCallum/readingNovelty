@@ -12,6 +12,7 @@ from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 from pdf_processor import PDFProcessor
 from novelty_detector import NoveltyDetector
+from llm_providers import discover_providers
 
 # Load environment variables
 load_dotenv()
@@ -46,43 +47,106 @@ def health_check():
     return jsonify({'status': 'healthy', 'message': 'PDF Novelty Detection Server is running'})
 
 
+@app.route('/providers', methods=['GET'])
+def list_providers():
+    """List available LLM providers and their status."""
+    providers_info = {}
+    for name, provider in novelty_detector.providers.items():
+        providers_info[name] = {
+            'name': name,
+            'available': provider.is_available(),
+            'active': name == novelty_detector.active_provider.name,
+        }
+        if hasattr(provider, 'model'):
+            providers_info[name]['model'] = provider.model
+        if hasattr(provider, 'base_url'):
+            providers_info[name]['base_url'] = provider.base_url
+    return jsonify({'providers': providers_info}), 200
+
+
+@app.route('/compare', methods=['POST'])
+def compare_providers():
+    """
+    Run novelty analysis with multiple providers for comparison.
+
+    Accepts JSON with 'text' field and optional 'providers' list.
+    """
+    try:
+        data = request.get_json()
+        if not data or 'text' not in data:
+            return jsonify({'error': 'No text provided'}), 400
+
+        text = data['text']
+        provider_names = data.get('providers', None)
+
+        chunks = pdf_processor.chunk_text(text)
+        logger.info(f"Created {len(chunks)} chunks for comparison")
+
+        results = novelty_detector.analyze_novelty_multi(chunks, provider_names)
+
+        response = {
+            'success': True,
+            'chunks_analyzed': len(chunks),
+            'chunks': [
+                {'chunk_index': i, 'text_preview': c['text'][:100]}
+                for i, c in enumerate(chunks)
+            ],
+            'providers': {
+                name: {
+                    'scores': scores,
+                    'avg': sum(scores) / len(scores) if scores else 0
+                }
+                for name, scores in results.items()
+            }
+        }
+        return jsonify(response), 200
+
+    except Exception as e:
+        logger.error(f"Error in comparison: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Error during comparison. Please try again.'}), 500
+
+
 @app.route('/upload', methods=['POST'])
 def upload_pdf():
     """
     Upload and analyze a PDF file.
-    
+
     Returns:
         JSON with analysis results and download link for annotated PDF
     """
     # Check if file is in request
     if 'file' not in request.files:
         return jsonify({'error': 'No file part in request'}), 400
-    
+
     file = request.files['file']
-    
+
     # Check if file is selected
     if file.filename == '':
         return jsonify({'error': 'No file selected'}), 400
-    
+
     # Check if file is allowed
     if not allowed_file(file.filename):
         return jsonify({'error': 'Only PDF files are allowed'}), 400
-    
+
     try:
         # Save uploaded file
         filename = secure_filename(file.filename)
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(filepath)
         logger.info(f"File saved: {filepath}")
-        
+
         # Extract text from PDF
         logger.info("Extracting text from PDF...")
         text_chunks = pdf_processor.extract_and_chunk_text(filepath)
         logger.info(f"Extracted {len(text_chunks)} text chunks")
-        
+
+        # Select provider (optional query param)
+        provider_name = request.args.get('provider')
+        provider = novelty_detector.providers.get(provider_name) if provider_name else None
+
         # Analyze novelty
         logger.info("Analyzing novelty...")
-        novelty_scores = novelty_detector.analyze_novelty(text_chunks)
+        novelty_scores = novelty_detector.analyze_novelty(text_chunks, provider=provider)
         logger.info("Novelty analysis complete")
         
         # Create annotated PDF
@@ -162,9 +226,13 @@ def analyze_text():
         # Chunk the text
         chunks = pdf_processor.chunk_text(text)
         logger.info(f"Created {len(chunks)} chunks from text")
-        
+
+        # Select provider (optional query param)
+        provider_name = request.args.get('provider')
+        provider = novelty_detector.providers.get(provider_name) if provider_name else None
+
         # Analyze novelty
-        novelty_scores = novelty_detector.analyze_novelty(chunks)
+        novelty_scores = novelty_detector.analyze_novelty(chunks, provider=provider)
         
         response = {
             'success': True,
