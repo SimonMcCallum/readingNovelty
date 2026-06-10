@@ -46,3 +46,6 @@ temp/
 # FAISS index
 *.index
 *.faiss
+
+# Per-assignment corpus (SQLite + FAISS) — generated data, never source
+corpus/

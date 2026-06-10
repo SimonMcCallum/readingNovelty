@@ -5,7 +5,7 @@ Uses LLMs and FAISS embeddings to detect novelty in text chunks.
 """
 
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
@@ -170,6 +170,136 @@ class NoveltyDetector:
         except Exception as e:
             logger.error(f"Error analyzing novelty: {str(e)}", exc_info=True)
             return [0.5] * len(chunks)
+
+    def embed_and_prompt_chunks(
+        self, chunks: List[Dict], provider: Optional[LLMProvider] = None
+    ) -> Tuple[np.ndarray, List[str]]:
+        """
+        Generate LLM prompts and embeddings for a list of chunks.
+
+        Returns (embeddings, prompts) where embeddings are over the LLM-generated
+        prompts (matching analyze_novelty's signal). Used by corpus-relative
+        scoring so the caller can persist both into the corpus store.
+        """
+        use_provider = provider or self.active_provider
+        prompts = []
+        for i, chunk in enumerate(chunks):
+            context_before = chunks[i - 1]['text'] if i > 0 else ""
+            context_after = chunks[i + 1]['text'] if i < len(chunks) - 1 else ""
+            prompts.append(
+                self.generate_prompt_for_chunk(
+                    chunk['text'], context_before, context_after, provider=use_provider
+                )
+            )
+        embeddings = self.embedding_model.encode(prompts, show_progress_bar=False)
+        return np.asarray(embeddings), prompts
+
+    @property
+    def embedding_dim(self) -> int:
+        return self.embedding_model.get_sentence_embedding_dimension()
+
+    _STOPWORDS = frozenset("""
+        a an and are as at be by for from has have he her his i in is it its of
+        on or that the their they this to was we were will with you your would
+        which not but also if then than these those there been being but more
+        most some such other any all can could should may might into about over
+        between within without per via etc eg e.g. i.e. ie one two three four
+        five also however therefore thus when where while because although
+    """.split())
+
+    @classmethod
+    def keyword_hint(cls, text: str, n: int = 5) -> str:
+        """Cheap, deterministic ~n-word topic hint (no LLM call).
+
+        Used to feed predict_chunk with minimal information about the missing
+        passage, so the predictive-novelty score measures what the LLM would
+        write without seeing the target — only its topic and neighbours.
+        """
+        from collections import Counter
+        words = [w.lower().strip('.,;:()[]"\'') for w in text.split()]
+        content = [w for w in words if len(w) > 3 and w not in cls._STOPWORDS]
+        if not content:
+            return text[:40]
+        top = [w for w, _ in Counter(content).most_common(n)]
+        return ' '.join(top)
+
+    @staticmethod
+    def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+        denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+        if denom < 1e-10:
+            return 0.0
+        return float(np.dot(a, b) / denom)
+
+    def analyze_llm_novelty(
+        self, chunks: List[Dict], provider: Optional[LLMProvider] = None,
+        hint_words: int = 5,
+    ) -> List[float]:
+        """
+        LLM-predictive novelty: ask the LLM to fill the gap between the
+        neighbours given a short hint, then score 1 - cosine(predicted, actual).
+
+        High score = the LLM (with the hint and the neighbours) wrote something
+        very different from the actual chunk — either because the chunk is
+        novel/surprising or because it's wrong relative to expectations.
+
+        Returns one score per chunk in [0, 1].
+        """
+        use_provider = provider or self.active_provider
+        if use_provider.name == 'fallback':
+            logger.warning(
+                "analyze_llm_novelty called with fallback provider; results "
+                "will not reflect real LLM predictability."
+            )
+
+        scores: List[float] = []
+        actual_texts = [c['text'] for c in chunks]
+        actual_embeddings = self.embedding_model.encode(actual_texts, show_progress_bar=False)
+        actual_embeddings = np.asarray(actual_embeddings)
+
+        predictions: List[str] = []
+        for i, chunk in enumerate(chunks):
+            context_before = chunks[i - 1]['text'] if i > 0 else ""
+            context_after = chunks[i + 1]['text'] if i < len(chunks) - 1 else ""
+            hint = self.keyword_hint(chunk['text'], n=hint_words)
+            try:
+                prediction = use_provider.predict_chunk(
+                    context_before, context_after, hint,
+                    target_length_words=max(50, len(chunk['text'].split())),
+                )
+            except Exception as e:
+                logger.error("predict_chunk failed on chunk %d: %s", i, e)
+                prediction = hint  # degrade gracefully
+            predictions.append(prediction)
+
+        predicted_embeddings = self.embedding_model.encode(predictions, show_progress_bar=False)
+        predicted_embeddings = np.asarray(predicted_embeddings)
+
+        for actual_emb, pred_emb in zip(actual_embeddings, predicted_embeddings):
+            sim = self._cosine(actual_emb, pred_emb)
+            scores.append(min(1.0, max(0.0, 1.0 - sim)))
+        return scores
+
+    @staticmethod
+    def combine_novelty_scores(
+        corpus_scores: List[float], llm_scores: List[float], alpha: float
+    ) -> List[float]:
+        """
+        Blend per-chunk corpus novelty with LLM-predictive novelty.
+
+        alpha=1.0 → pure corpus (current Phase B behaviour).
+        alpha=0.0 → pure LLM predictability.
+        alpha=0.5 → balanced.
+
+        Lengths must match. Both score lists must already be in [0, 1].
+        """
+        if len(corpus_scores) != len(llm_scores):
+            raise ValueError("corpus_scores and llm_scores length mismatch")
+        if not (0.0 <= alpha <= 1.0):
+            raise ValueError("alpha must be in [0, 1]")
+        return [
+            alpha * c + (1.0 - alpha) * l
+            for c, l in zip(corpus_scores, llm_scores)
+        ]
 
     def analyze_novelty_multi(self, chunks: List[Dict],
                               provider_names: Optional[List[str]] = None) -> Dict[str, List[float]]:

@@ -158,11 +158,12 @@ class TestDiscoverProviders(unittest.TestCase):
         self.assertIn('fallback', providers)
 
     @patch.dict(os.environ, {
+        'LOCAL_ONLY': '0',
         'OLLAMA_REMOTE_URL': 'https://simonmccallum.org.nz/llm/v1',
         'OLLAMA_REMOTE_API_KEY': 'test-key',
         'OLLAMA_REMOTE_MODEL': 'qwen2.5:7b',
     }, clear=True)
-    def test_discovers_ollama_remote(self):
+    def test_discovers_ollama_remote_when_local_only_off(self):
         from llm_providers import discover_providers
         providers = discover_providers()
         self.assertIn('ollama-remote', providers)
@@ -182,6 +183,55 @@ class TestDiscoverProviders(unittest.TestCase):
         from llm_providers import discover_providers
         providers = discover_providers()
         self.assertNotIn('anthropic', providers)
+
+
+class TestLocalOnlyMode(unittest.TestCase):
+    """Test that LOCAL_ONLY mode gates cloud and remote providers."""
+
+    @patch.dict(os.environ, {
+        'ANTHROPIC_API_KEY': 'real-looking-key',
+        'OPENAI_API_KEY': 'real-looking-key',
+        'OLLAMA_REMOTE_URL': 'https://example.com/llm/v1',
+    }, clear=True)
+    def test_local_only_default_excludes_cloud_and_remote(self):
+        from llm_providers import discover_providers
+        providers = discover_providers()
+        self.assertNotIn('anthropic', providers)
+        self.assertNotIn('openai', providers)
+        self.assertNotIn('ollama-remote', providers)
+        self.assertIn('fallback', providers)
+
+    @patch.dict(os.environ, {
+        'LOCAL_ONLY': '0',
+        'OLLAMA_REMOTE_URL': 'https://example.com/llm/v1',
+    }, clear=True)
+    def test_local_only_off_allows_remote(self):
+        from llm_providers import discover_providers
+        providers = discover_providers()
+        self.assertIn('ollama-remote', providers)
+
+    @patch.dict(os.environ, {
+        'LOCAL_ONLY': '1',
+        'OLLAMA_HOST': 'localhost',
+        'OLLAMA_REMOTE_URL': 'https://example.com/llm/v1',
+    }, clear=True)
+    def test_local_only_keeps_ollama_local_first(self):
+        from llm_providers import discover_providers
+        providers = discover_providers()
+        # Insertion order = priority; ollama-local must precede fallback
+        keys = list(providers.keys())
+        self.assertEqual(keys[0], 'ollama-local')
+        self.assertNotIn('ollama-remote', providers)
+
+    @patch.dict(os.environ, {'LOCAL_ONLY': 'false'}, clear=True)
+    def test_local_only_accepts_false_string(self):
+        from llm_providers import _local_only_enabled
+        self.assertFalse(_local_only_enabled())
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_local_only_default_on(self):
+        from llm_providers import _local_only_enabled
+        self.assertTrue(_local_only_enabled())
 
 
 class TestPromptTemplates(unittest.TestCase):

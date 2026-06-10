@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C * log*)",
+      "Bash(git -C * show*)",
+      "Bash(git -C * ls-files*)"
+    ]
+  }
+}

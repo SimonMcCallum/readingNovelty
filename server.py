@@ -7,12 +7,13 @@ and download annotated versions with novelty scores.
 
 import os
 import logging
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, render_template_string
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 from pdf_processor import PDFProcessor
 from novelty_detector import NoveltyDetector
-from llm_providers import discover_providers
+from llm_providers import discover_providers, _local_only_enabled
+from corpus import CorpusStore
 
 # Load environment variables
 load_dotenv()
@@ -33,6 +34,40 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 pdf_processor = PDFProcessor()
 novelty_detector = NoveltyDetector()
 
+CORPUS_DIR = os.getenv('CORPUS_DIR', 'corpus')
+corpus_store = CorpusStore(CORPUS_DIR, embedding_dim=novelty_detector.embedding_dim)
+
+LOCAL_ONLY = _local_only_enabled()
+
+
+def _log_privacy_banner():
+    """Log the active privacy posture and provider so it is obvious in startup logs."""
+    active = novelty_detector.active_provider.name
+    if LOCAL_ONLY:
+        logger.info("PRIVACY: LOCAL_ONLY=1 — cloud and remote providers disabled.")
+    else:
+        logger.warning(
+            "PRIVACY: LOCAL_ONLY=0 — cloud providers may process submissions. "
+            "Do not use for copyrighted content."
+        )
+    logger.info("Active provider: %s", active)
+    if active == 'fallback':
+        logger.warning(
+            "No LLM provider is reachable; using keyword fallback. Assessment "
+            "endpoints will refuse to run in this state."
+        )
+
+
+def _assessment_provider_ready() -> bool:
+    """True only when a real LLM provider is active (fallback is not acceptable)."""
+    active = novelty_detector.active_provider
+    if active.name == 'fallback':
+        return False
+    return active.is_available()
+
+
+_log_privacy_banner()
+
 ALLOWED_EXTENSIONS = {'pdf'}
 
 
@@ -43,8 +78,14 @@ def allowed_file(filename):
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Health check endpoint."""
-    return jsonify({'status': 'healthy', 'message': 'PDF Novelty Detection Server is running'})
+    """Health check endpoint. Reports privacy posture and assessment readiness."""
+    return jsonify({
+        'status': 'healthy',
+        'message': 'PDF Novelty Detection Server is running',
+        'local_only': LOCAL_ONLY,
+        'active_provider': novelty_detector.active_provider.name,
+        'assessment_ready': _assessment_provider_ready(),
+    })
 
 
 @app.route('/providers', methods=['GET'])
@@ -61,7 +102,10 @@ def list_providers():
             providers_info[name]['model'] = provider.model
         if hasattr(provider, 'base_url'):
             providers_info[name]['base_url'] = provider.base_url
-    return jsonify({'providers': providers_info}), 200
+    return jsonify({
+        'local_only': LOCAL_ONLY,
+        'providers': providers_info,
+    }), 200
 
 
 @app.route('/compare', methods=['POST'])
@@ -106,6 +150,192 @@ def compare_providers():
         return jsonify({'error': 'Error during comparison. Please try again.'}), 500
 
 
+@app.route('/assignments', methods=['POST'])
+def create_assignment():
+    """Register an assignment so submissions can be scored against its cohort."""
+    data = request.get_json(silent=True) or {}
+    assignment_id = data.get('assignment_id')
+    name = data.get('name')
+    if not assignment_id:
+        return jsonify({'error': 'assignment_id is required'}), 400
+    corpus_store.ensure_assignment(assignment_id, name=name)
+    return jsonify({'success': True, 'assignment': corpus_store.get_assignment(assignment_id)}), 201
+
+
+@app.route('/assignments/<assignment_id>', methods=['GET'])
+def get_assignment(assignment_id):
+    """Return assignment metadata and submission count."""
+    info = corpus_store.get_assignment(assignment_id)
+    if info is None:
+        return jsonify({'error': 'Assignment not found'}), 404
+    return jsonify(info), 200
+
+
+@app.route('/assignments/<assignment_id>/submissions', methods=['POST'])
+def submit_to_assignment(assignment_id):
+    """
+    Score a submission PDF against the assignment cohort and append it.
+
+    Form fields: file (PDF), student_id (optional), submission_id (optional).
+    """
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part in request'}), 400
+    file = request.files['file']
+    if file.filename == '' or not allowed_file(file.filename):
+        return jsonify({'error': 'Only PDF files are allowed'}), 400
+
+    if not _assessment_provider_ready():
+        return jsonify({
+            'error': 'No LLM provider is available for assessment.',
+            'detail': f"Active provider is '{novelty_detector.active_provider.name}'.",
+        }), 503
+
+    student_id = request.form.get('student_id')
+    submission_id = request.form.get('submission_id') or f"{assignment_id}:{secure_filename(file.filename)}"
+
+    filename = secure_filename(file.filename)
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(filepath)
+
+    try:
+        chunks = pdf_processor.extract_and_chunk_text(filepath)
+        if not chunks:
+            return jsonify({'error': 'PDF contained no extractable text'}), 400
+
+        corpus_store.ensure_assignment(assignment_id)
+        embeddings, prompts = novelty_detector.embed_and_prompt_chunks(chunks)
+
+        # Score against the prior corpus (excluding any earlier version of
+        # this same submission_id, so a re-upload doesn't score itself).
+        novelty_scores = corpus_store.score_against_corpus(
+            assignment_id, embeddings, exclude_submission_id=submission_id
+        )
+
+        for chunk, prompt in zip(chunks, prompts):
+            chunk['prompt'] = prompt
+
+        record = corpus_store.add_submission(
+            assignment_id=assignment_id,
+            submission_id=submission_id,
+            student_id=student_id,
+            filename=filename,
+            chunks=chunks,
+            embeddings=embeddings,
+            novelty_scores=novelty_scores,
+        )
+
+        annotated_filename = f"annotated_{submission_id}_{filename}"
+        annotated_filepath = os.path.join(app.config['UPLOAD_FOLDER'], annotated_filename)
+        pdf_processor.create_annotated_pdf(filepath, chunks, novelty_scores, annotated_filepath)
+
+        return jsonify({
+            'success': True,
+            'submission': record,
+            'novelty_scores': [
+                {
+                    'chunk_index': i,
+                    'text_preview': chunk['text'][:100],
+                    'novelty_score': score,
+                }
+                for i, (chunk, score) in enumerate(zip(chunks, novelty_scores))
+            ],
+            'download_url': f'/download/{annotated_filename}',
+            'corpus_priors': corpus_store.get_assignment(assignment_id)['chunk_count'] - len(chunks),
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error processing submission: {e}", exc_info=True)
+        return jsonify({'error': 'Error processing submission.'}), 500
+
+
+@app.route('/assignments/<assignment_id>/submissions', methods=['GET'])
+def list_submissions(assignment_id):
+    """List submissions for an assignment, ordered most-recent first."""
+    if corpus_store.get_assignment(assignment_id) is None:
+        return jsonify({'error': 'Assignment not found'}), 404
+    return jsonify({
+        'assignment_id': assignment_id,
+        'submissions': corpus_store.list_submissions(assignment_id),
+    }), 200
+
+
+READER_TEMPLATE = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Novelty: {{ assignment.assignment_id }}</title>
+<style>
+ body { font-family: -apple-system, Segoe UI, sans-serif; max-width: 960px; margin: 2em auto; color: #222; }
+ h1 { margin-bottom: 0.2em; }
+ .meta { color: #666; margin-bottom: 1.5em; }
+ table { border-collapse: collapse; width: 100%; }
+ th, td { padding: 8px 10px; border-bottom: 1px solid #eee; text-align: left; }
+ th { background: #f7f7f8; font-weight: 600; }
+ .score { font-variant-numeric: tabular-nums; font-weight: 600; padding: 2px 6px; border-radius: 3px; }
+ .s-high { background: #d4f5d4; color: #145214; }
+ .s-med { background: #fff6cc; color: #6a5400; }
+ .s-low { background: #ffe0c2; color: #7a3a00; }
+ .s-vlow { background: #ffd2d2; color: #800000; }
+ a { color: #0a58ca; text-decoration: none; }
+ a:hover { text-decoration: underline; }
+ .empty { color: #999; font-style: italic; }
+</style>
+</head>
+<body>
+<h1>{{ assignment.name or assignment.assignment_id }}</h1>
+<div class="meta">
+ Assignment ID: <code>{{ assignment.assignment_id }}</code> &middot;
+ {{ assignment.submission_count }} submissions &middot;
+ {{ assignment.chunk_count }} chunks in corpus
+</div>
+{% if submissions %}
+<table>
+ <tr><th>Submitted</th><th>Student</th><th>Filename</th><th>Chunks</th><th>Avg novelty</th><th>PDF</th></tr>
+ {% for s in submissions %}
+ <tr>
+  <td>{{ s.submitted_at }}</td>
+  <td>{{ s.student_id or '-' }}</td>
+  <td><code>{{ s.filename }}</code></td>
+  <td>{{ s.chunk_count }}</td>
+  <td>
+   {% set sc = s.avg_novelty %}
+   {% if sc >= 0.7 %}<span class="score s-high">{{ '%.2f'|format(sc) }}</span>
+   {% elif sc >= 0.4 %}<span class="score s-med">{{ '%.2f'|format(sc) }}</span>
+   {% elif sc >= 0.2 %}<span class="score s-low">{{ '%.2f'|format(sc) }}</span>
+   {% else %}<span class="score s-vlow">{{ '%.2f'|format(sc) }}</span>{% endif %}
+  </td>
+  <td><a href="/download/annotated_{{ s.submission_id }}_{{ s.filename }}">annotated</a></td>
+ </tr>
+ {% endfor %}
+</table>
+{% else %}
+<p class="empty">No submissions yet.</p>
+{% endif %}
+</body>
+</html>"""
+
+
+@app.route('/assignments/<assignment_id>/reader', methods=['GET'])
+def reader_view(assignment_id):
+    """Grader-facing HTML view: cohort ranked by submission time with novelty + PDF links."""
+    assignment = corpus_store.get_assignment(assignment_id)
+    if assignment is None:
+        return jsonify({'error': 'Assignment not found'}), 404
+    submissions = corpus_store.list_submissions(assignment_id)
+    return render_template_string(
+        READER_TEMPLATE, assignment=assignment, submissions=submissions
+    )
+
+
+@app.route('/assignments/<assignment_id>/submissions/<submission_id>', methods=['GET'])
+def get_submission_detail(assignment_id, submission_id):
+    """Return per-chunk novelty detail for a single submission."""
+    sub = corpus_store.get_submission(submission_id)
+    if sub is None or sub['assignment_id'] != assignment_id:
+        return jsonify({'error': 'Submission not found'}), 404
+    return jsonify(sub), 200
+
+
 @app.route('/upload', methods=['POST'])
 def upload_pdf():
     """
@@ -127,6 +357,15 @@ def upload_pdf():
     # Check if file is allowed
     if not allowed_file(file.filename):
         return jsonify({'error': 'Only PDF files are allowed'}), 400
+
+    if not _assessment_provider_ready():
+        return jsonify({
+            'error': 'No LLM provider is available for assessment.',
+            'detail': (
+                f"Active provider is '{novelty_detector.active_provider.name}'. "
+                'In LOCAL_ONLY mode, configure OLLAMA_HOST and ensure Ollama is reachable.'
+            ),
+        }), 503
 
     try:
         # Save uploaded file
