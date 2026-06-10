@@ -127,6 +127,70 @@ class TestAnalyzeLlmNovelty(unittest.TestCase):
         self.assertLessEqual(scores[0], 1.0)
 
 
+class TestPredictiveNoveltyParallel(unittest.TestCase):
+    """Verify that thread-pool execution preserves order and result correctness."""
+
+    @patch.dict(os.environ, _CLEAR_API_KEYS)
+    def test_parallel_matches_serial(self):
+        """Parallel results must match serial for the same provider/inputs."""
+        from novelty_detector import NoveltyDetector
+        from llm_providers import LLMProvider
+
+        class DeterministicProvider(LLMProvider):
+            """Returns a fixed reply derived from the hint — deterministic
+            regardless of execution order or concurrency."""
+            name = "det"
+
+            def generate_prompt(self, *a, **kw):
+                return "ignored"
+
+            def predict_chunk(self, context_before, context_after, hint, target_length_words=150):
+                return f"predicted from hint: {hint}"
+
+        det = NoveltyDetector(provider=DeterministicProvider())
+        chunks = [{'text': f'Topic {i} discusses some content. ' * 20} for i in range(6)]
+
+        serial = det.analyze_llm_novelty(chunks, max_workers=1)
+        parallel = det.analyze_llm_novelty(chunks, max_workers=4)
+
+        self.assertEqual(len(serial), len(parallel))
+        for s, p in zip(serial, parallel):
+            self.assertAlmostEqual(s, p, places=5)
+
+    @patch.dict(os.environ, _CLEAR_API_KEYS)
+    def test_parallel_actually_runs_concurrently(self):
+        """With a slow provider, parallel must be measurably faster than serial."""
+        import time
+        from novelty_detector import NoveltyDetector
+        from llm_providers import LLMProvider
+
+        class SlowProvider(LLMProvider):
+            name = "slow"
+
+            def generate_prompt(self, *a, **kw):
+                return "ignored"
+
+            def predict_chunk(self, *a, **kw):
+                time.sleep(0.15)  # cheap I/O simulation
+                return "predicted"
+
+        det = NoveltyDetector(provider=SlowProvider())
+        chunks = [{'text': f'Chunk {i}.'} for i in range(8)]
+
+        t0 = time.monotonic()
+        det.analyze_llm_novelty(chunks, max_workers=1)
+        serial_s = time.monotonic() - t0
+
+        t1 = time.monotonic()
+        det.analyze_llm_novelty(chunks, max_workers=4)
+        parallel_s = time.monotonic() - t1
+
+        # 4-way parallelism on 8 items should be faster than serial. Allow
+        # generous headroom: parallel must finish in less than 60% of serial.
+        self.assertLess(parallel_s, serial_s * 0.6,
+                        f"parallel={parallel_s:.2f}s should be << serial={serial_s:.2f}s")
+
+
 class TestGeminiProvider(unittest.TestCase):
     def test_predict_chunk_posts_to_api(self):
         from llm_providers import GeminiProvider

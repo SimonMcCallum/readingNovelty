@@ -115,7 +115,9 @@ class CorpusStore:
         index = self._index_cache.get(assignment_id)
         if index is None:
             return
-        faiss.write_index(index, self._index_path(assignment_id))
+        path = self._index_path(assignment_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        faiss.write_index(index, path)
 
     def ensure_assignment(self, assignment_id: str, name: Optional[str] = None):
         """Idempotently register an assignment."""
@@ -312,3 +314,73 @@ class CorpusStore:
             result = dict(sub)
             result['chunks'] = [dict(c) for c in chunks]
             return result
+
+    def rebuild_index(self, assignment_id: str, embedding_model) -> Dict:
+        """
+        Rebuild the FAISS index for an assignment from the chunks currently
+        in SQLite, dropping any orphan rows left behind by re-uploads.
+
+        Behaviour:
+          - For each surviving chunk: re-embed its prompt (cohort mode) or
+            its text (read-folder / citation-graph mode where prompt='').
+          - Build a fresh IndexFlatL2 in chunk_id order.
+          - Update embedding_row in SQLite so scoring still aligns.
+          - Persist the new index to disk.
+
+        Use after heavy resubmission cycles. Not needed for normal operation.
+
+        Returns counts: rows_before, rows_after, orphans_removed, embeddings_recomputed.
+        """
+        with self._lock:
+            cached = self._index_cache.pop(assignment_id, None)
+            rows_before = cached.ntotal if cached is not None else (
+                faiss.read_index(self._index_path(assignment_id)).ntotal
+                if os.path.exists(self._index_path(assignment_id)) else 0
+            )
+
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT chunk_id, text, prompt FROM chunks "
+                    "WHERE assignment_id = ? ORDER BY chunk_id",
+                    (assignment_id,),
+                ).fetchall()
+
+                texts_to_embed = [
+                    (r['prompt'] or '').strip() or r['text']
+                    for r in rows
+                ]
+                if texts_to_embed:
+                    embeddings = np.asarray(
+                        embedding_model.encode(texts_to_embed, show_progress_bar=False),
+                        dtype='float32',
+                    )
+                    dim = embeddings.shape[1]
+                else:
+                    embeddings = np.zeros((0, self.embedding_dim), dtype='float32')
+                    dim = self.embedding_dim
+
+                fresh = faiss.IndexFlatL2(dim)
+                if len(embeddings) > 0:
+                    fresh.add(embeddings)
+
+                # Atomically rewrite chunk row assignments under the same lock
+                for new_row, r in enumerate(rows):
+                    conn.execute(
+                        "UPDATE chunks SET embedding_row = ? WHERE chunk_id = ?",
+                        (new_row, r['chunk_id']),
+                    )
+                # Sync chunk_count to match
+                conn.execute(
+                    "UPDATE assignments SET chunk_count = ? WHERE assignment_id = ?",
+                    (len(rows), assignment_id),
+                )
+
+            self._index_cache[assignment_id] = fresh
+            self._persist_index(assignment_id)
+
+            return {
+                'rows_before': rows_before,
+                'rows_after': fresh.ntotal,
+                'orphans_removed': max(0, rows_before - fresh.ntotal),
+                'embeddings_recomputed': len(rows),
+            }

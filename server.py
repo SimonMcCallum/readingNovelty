@@ -248,6 +248,23 @@ def submit_to_assignment(assignment_id):
         return jsonify({'error': 'Error processing submission.'}), 500
 
 
+@app.route('/assignments/<assignment_id>/rebuild_index', methods=['POST'])
+def rebuild_index(assignment_id):
+    """Drop orphan FAISS rows left behind by re-uploads; recompute embeddings
+    from the SQLite-stored prompts/text."""
+    if corpus_store.get_assignment(assignment_id) is None:
+        return jsonify({'error': 'Assignment not found'}), 404
+    report = corpus_store.rebuild_index(
+        assignment_id, novelty_detector.embedding_model
+    )
+    logger.info(
+        "Rebuilt index for %s: %d before, %d after, %d orphans removed",
+        assignment_id, report['rows_before'], report['rows_after'],
+        report['orphans_removed'],
+    )
+    return jsonify({'success': True, 'rebuild': report}), 200
+
+
 @app.route('/assignments/<assignment_id>/submissions', methods=['GET'])
 def list_submissions(assignment_id):
     """List submissions for an assignment, ordered most-recent first."""

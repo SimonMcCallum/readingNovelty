@@ -125,5 +125,79 @@ class TestCorpusStore(unittest.TestCase):
         self.assertEqual(detail['chunks'][0]['text'], 'v2')
 
 
+class _StubEmbeddingModel:
+    """Deterministic 16-dim embedding for rebuild_index tests — no torch."""
+
+    def encode(self, texts, show_progress_bar=False):
+        rows = []
+        for text in texts:
+            padded = ((text or ' ') + ' ' * 8)[:8]
+            base = np.array([(ord(c) % 16) / 15.0 for c in padded], dtype='float32')
+            rows.append(np.tile(base, 2))
+        return np.vstack(rows)
+
+
+class TestRebuildIndex(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='rebuild_test_')
+        self.store = CorpusStore(self.tmp, embedding_dim=16)
+        self.embed = _StubEmbeddingModel()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_rebuild_drops_orphan_rows_after_reupload(self):
+        # First version of a submission: 3 chunks
+        chunks_v1 = [{'text': f'first version chunk {i}', 'prompt': f'pv1-{i}'} for i in range(3)]
+        emb_v1 = self.embed.encode([c['prompt'] for c in chunks_v1])
+        self.store.add_submission('asg1', 'sub1', 's1', 'a.pdf',
+                                  chunks_v1, emb_v1, [1.0, 1.0, 1.0])
+
+        # Replace with v2: 2 chunks (1 fewer) — old FAISS rows now orphaned
+        chunks_v2 = [{'text': f'second version chunk {i}', 'prompt': f'pv2-{i}'} for i in range(2)]
+        emb_v2 = self.embed.encode([c['prompt'] for c in chunks_v2])
+        self.store.add_submission('asg1', 'sub1', 's1', 'a.pdf',
+                                  chunks_v2, emb_v2, [1.0, 1.0])
+
+        # FAISS holds 3 + 2 = 5 rows; SQLite has 2 surviving chunks
+        index = self.store._load_index('asg1')
+        self.assertEqual(index.ntotal, 5)
+
+        report = self.store.rebuild_index('asg1', self.embed)
+        self.assertEqual(report['rows_before'], 5)
+        self.assertEqual(report['rows_after'], 2)
+        self.assertEqual(report['orphans_removed'], 3)
+        self.assertEqual(report['embeddings_recomputed'], 2)
+
+        # New index is the right size and rows align with chunk rows
+        new_index = self.store._load_index('asg1')
+        self.assertEqual(new_index.ntotal, 2)
+
+    def test_rebuild_keeps_scoring_consistent_after_orphan_drop(self):
+        """After rebuild, score_against_corpus should still find the right neighbours."""
+        chunks_v1 = [{'text': 'quantum entanglement', 'prompt': 'quantum'}]
+        emb_v1 = self.embed.encode([c['prompt'] for c in chunks_v1])
+        self.store.add_submission('asg1', 'sub1', 's1', 'a.pdf',
+                                  chunks_v1, emb_v1, [1.0])
+        # Replace it — now there's 1 orphan + 1 live
+        chunks_v2 = [{'text': 'marine biology', 'prompt': 'marine'}]
+        emb_v2 = self.embed.encode([c['prompt'] for c in chunks_v2])
+        self.store.add_submission('asg1', 'sub1', 's1', 'a.pdf',
+                                  chunks_v2, emb_v2, [1.0])
+
+        self.store.rebuild_index('asg1', self.embed)
+
+        # Querying with the v2 embedding should find an exact match
+        query = self.embed.encode(['marine'])
+        scores = self.store.score_against_corpus('asg1', query)
+        self.assertLess(scores[0], 0.1)
+
+    def test_rebuild_on_empty_assignment_is_noop(self):
+        self.store.ensure_assignment('empty')
+        report = self.store.rebuild_index('empty', self.embed)
+        self.assertEqual(report['rows_after'], 0)
+        self.assertEqual(report['embeddings_recomputed'], 0)
+
+
 if __name__ == '__main__':
     unittest.main()

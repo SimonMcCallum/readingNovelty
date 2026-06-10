@@ -112,6 +112,7 @@ def score_new_pdf(
     processor: PDFProcessor,
     alpha: float,
     annotated_output: Optional[str] = None,
+    predict_workers: int = 4,
 ) -> Dict:
     """Score a new PDF against the read corpus. Returns a report dict."""
     if not os.path.isfile(new_pdf):
@@ -135,7 +136,7 @@ def score_new_pdf(
                 "is 'fallback'. Configure OLLAMA_HOST (and start Ollama) or "
                 "set LOCAL_ONLY=0 with a cloud provider key."
             )
-        llm_scores = detector.analyze_llm_novelty(chunks)
+        llm_scores = detector.analyze_llm_novelty(chunks, max_workers=predict_workers)
         blended = NoveltyDetector.combine_novelty_scores(corpus_scores, llm_scores, alpha)
     else:
         blended = list(corpus_scores)
@@ -186,6 +187,10 @@ def main(argv=None) -> int:
                         help='Path for the annotated PDF (only used with --new).')
     parser.add_argument('--reingest', action='store_true',
                         help='Re-ingest every PDF in --read-folder even if already present.')
+    parser.add_argument('--predict-workers', type=int, default=4,
+                        help='Concurrent predict_chunk calls when alpha < 1.0. '
+                             'Default 4. Use 1 to debug, 2-3 for Gemini free tier, '
+                             'higher only if Ollama is configured with OLLAMA_NUM_PARALLEL.')
     parser.add_argument('--report-json',
                         help='Write the per-chunk report as JSON to this path.')
     parser.add_argument('--verbose', action='store_true')
@@ -229,6 +234,7 @@ def main(argv=None) -> int:
     report = score_new_pdf(
         args.new, args.corpus_id, corpus, detector, processor,
         alpha=args.alpha, annotated_output=annotated_output,
+        predict_workers=args.predict_workers,
     )
 
     logger.info(

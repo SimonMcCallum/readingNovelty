@@ -5,6 +5,7 @@ Uses LLMs and FAISS embeddings to detect novelty in text chunks.
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional, Tuple
 import numpy as np
 import faiss
@@ -232,7 +233,7 @@ class NoveltyDetector:
 
     def analyze_llm_novelty(
         self, chunks: List[Dict], provider: Optional[LLMProvider] = None,
-        hint_words: int = 5,
+        hint_words: int = 5, max_workers: int = 4,
     ) -> List[float]:
         """
         LLM-predictive novelty: ask the LLM to fill the gap between the
@@ -241,6 +242,11 @@ class NoveltyDetector:
         High score = the LLM (with the hint and the neighbours) wrote something
         very different from the actual chunk — either because the chunk is
         novel/surprising or because it's wrong relative to expectations.
+
+        max_workers controls how many predict_chunk calls run concurrently.
+        For local Ollama this helps only up to Ollama's parallel-request
+        capacity (`OLLAMA_NUM_PARALLEL`, default 1). For Gemini free tier,
+        keep it <= 3 to avoid 429s. Pass max_workers=1 for serial behaviour.
 
         Returns one score per chunk in [0, 1].
         """
@@ -251,29 +257,36 @@ class NoveltyDetector:
                 "will not reflect real LLM predictability."
             )
 
-        scores: List[float] = []
         actual_texts = [c['text'] for c in chunks]
-        actual_embeddings = self.embedding_model.encode(actual_texts, show_progress_bar=False)
-        actual_embeddings = np.asarray(actual_embeddings)
+        actual_embeddings = np.asarray(
+            self.embedding_model.encode(actual_texts, show_progress_bar=False)
+        )
 
-        predictions: List[str] = []
-        for i, chunk in enumerate(chunks):
+        def predict_one(idx_chunk: Tuple[int, Dict]) -> str:
+            i, chunk = idx_chunk
             context_before = chunks[i - 1]['text'] if i > 0 else ""
             context_after = chunks[i + 1]['text'] if i < len(chunks) - 1 else ""
             hint = self.keyword_hint(chunk['text'], n=hint_words)
             try:
-                prediction = use_provider.predict_chunk(
+                return use_provider.predict_chunk(
                     context_before, context_after, hint,
                     target_length_words=max(50, len(chunk['text'].split())),
                 )
             except Exception as e:
                 logger.error("predict_chunk failed on chunk %d: %s", i, e)
-                prediction = hint  # degrade gracefully
-            predictions.append(prediction)
+                return hint  # degrade gracefully
 
-        predicted_embeddings = self.embedding_model.encode(predictions, show_progress_bar=False)
-        predicted_embeddings = np.asarray(predicted_embeddings)
+        if max_workers <= 1 or len(chunks) <= 1:
+            predictions = [predict_one((i, c)) for i, c in enumerate(chunks)]
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                predictions = list(pool.map(predict_one, enumerate(chunks)))
 
+        predicted_embeddings = np.asarray(
+            self.embedding_model.encode(predictions, show_progress_bar=False)
+        )
+
+        scores: List[float] = []
         for actual_emb, pred_emb in zip(actual_embeddings, predicted_embeddings):
             sim = self._cosine(actual_emb, pred_emb)
             scores.append(min(1.0, max(0.0, 1.0 - sim)))
