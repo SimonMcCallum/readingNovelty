@@ -86,8 +86,17 @@ class CorpusStore:
         finally:
             conn.close()
 
+    @staticmethod
+    def _safe_dirname(assignment_id: str) -> str:
+        """Map an assignment_id to a filesystem-safe directory name.
+
+        SQLite keeps the original id; only the on-disk FAISS folder is sanitised.
+        Windows in particular rejects `:` and a few other chars in path segments.
+        """
+        return ''.join(c if c.isalnum() or c in '._-' else '_' for c in assignment_id)
+
     def _index_path(self, assignment_id: str) -> str:
-        return os.path.join(self.corpus_dir, assignment_id, 'index.faiss')
+        return os.path.join(self.corpus_dir, self._safe_dirname(assignment_id), 'index.faiss')
 
     def _load_index(self, assignment_id: str) -> faiss.Index:
         """Load (or create) the FAISS index for an assignment."""
