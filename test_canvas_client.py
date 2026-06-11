@@ -161,6 +161,40 @@ class TestUploadCommentFile(unittest.TestCase):
             os.unlink(file_path)
 
 
+class TestPreflightHelpers(unittest.TestCase):
+    def test_get_self_returns_user(self):
+        c = CanvasClient('https://x', 'tok')
+        with patch.object(c.session, 'get', return_value=_resp(
+            json_body={'id': 42, 'name': 'Alice', 'primary_email': 'a@x.edu'}
+        )) as get:
+            me = c.get_self()
+        self.assertEqual(me['id'], 42)
+        call = get.call_args
+        self.assertIn('/users/self', call.args[0])
+
+    def test_get_self_bad_token_raises(self):
+        c = CanvasClient('https://x', 'tok')
+        with patch.object(c.session, 'get', return_value=_resp(status=401, json_body={'errors': 'no'})):
+            with self.assertRaises(CanvasError):
+                c.get_self()
+
+    def test_get_assignment_returns_metadata(self):
+        c = CanvasClient('https://x', 'tok')
+        with patch.object(c.session, 'get', return_value=_resp(
+            json_body={'id': 12, 'name': 'Essay 1', 'submission_types': ['online_upload']}
+        )) as get:
+            asg = c.get_assignment('C1', 'A1')
+        self.assertEqual(asg['name'], 'Essay 1')
+        call = get.call_args
+        self.assertIn('/courses/C1/assignments/A1', call.args[0])
+
+    def test_get_assignment_404_raises(self):
+        c = CanvasClient('https://x', 'tok')
+        with patch.object(c.session, 'get', return_value=_resp(status=404)):
+            with self.assertRaises(CanvasError):
+                c.get_assignment('C1', 'A1')
+
+
 class TestPostSubmissionComment(unittest.TestCase):
     def test_attaches_file_ids(self):
         c = CanvasClient('https://x', 'tok')

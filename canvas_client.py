@@ -69,7 +69,29 @@ class CanvasClient:
                     return url
         return None
 
-    # ------- assignment + submission reads -------
+    # ------- identity + assignment + submission reads -------
+
+    def get_self(self) -> Dict:
+        """GET /users/self — proves the access token works and reveals which
+        user it belongs to. Cheap preflight check."""
+        url = self._url('/users/self')
+        resp = self.session.get(url, timeout=self.timeout)
+        if resp.status_code != 200:
+            raise CanvasError(
+                f"Token check failed: {resp.status_code} {resp.text[:300]}"
+            )
+        return resp.json()
+
+    def get_assignment(self, course_id: str, assignment_id: str) -> Dict:
+        """Fetch a single assignment's metadata (name, due dates, etc.)."""
+        url = self._url(f"/courses/{course_id}/assignments/{assignment_id}")
+        resp = self.session.get(url, timeout=self.timeout)
+        if resp.status_code != 200:
+            raise CanvasError(
+                f"Could not fetch assignment {course_id}/{assignment_id}: "
+                f"{resp.status_code} {resp.text[:300]}"
+            )
+        return resp.json()
 
     def list_submissions(self, course_id: str, assignment_id: str) -> List[Dict]:
         """Return all submissions for an assignment with their attachments."""

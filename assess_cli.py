@@ -185,6 +185,10 @@ def main(argv=None) -> int:
                         help='Re-process submissions even if a [novelty-bot] comment exists.')
     parser.add_argument('--dry-run', action='store_true',
                         help='Score locally but do not post comments back to Canvas.')
+    parser.add_argument('--preflight', action='store_true',
+                        help='Validate token + show what would be processed. No scoring, no posting.')
+    parser.add_argument('--limit', type=int,
+                        help='Stop after this many submissions. Useful for a first real-run test.')
     parser.add_argument('--verbose', action='store_true')
     args = parser.parse_args(argv)
 
@@ -195,6 +199,12 @@ def main(argv=None) -> int:
 
     if not args.base_url or not args.token:
         parser.error("--base-url and --token (or CANVAS_BASE_URL / CANVAS_TOKEN) are required")
+
+    canvas = CanvasClient(args.base_url, args.token)
+
+    # Preflight: validate token + show what would be processed, then exit.
+    if args.preflight:
+        return _preflight(canvas, args)
 
     if not _local_only_enabled():
         logger.warning(
@@ -212,8 +222,6 @@ def main(argv=None) -> int:
     corpus = CorpusStore(args.corpus_dir, embedding_dim=detector.embedding_dim)
     corpus.ensure_assignment(args.internal_id, name=f"Canvas {args.course}/{args.assignment}")
 
-    canvas = CanvasClient(args.base_url, args.token)
-
     try:
         submissions = canvas.list_submissions(args.course, args.assignment)
     except CanvasError as e:
@@ -224,6 +232,9 @@ def main(argv=None) -> int:
         processed = 0
         skipped = 0
         for submission in submissions:
+            if args.limit is not None and processed >= args.limit:
+                logger.info("--limit %d reached; stopping.", args.limit)
+                break
             if not submission.get('attachments'):
                 continue
             if not args.rescore and already_assessed(submission):
@@ -241,6 +252,61 @@ def main(argv=None) -> int:
                              submission.get('id'), e, exc_info=args.verbose)
 
     logger.info("Done. Processed: %d, skipped: %d", processed, skipped)
+    return 0
+
+
+def _preflight(canvas: CanvasClient, args) -> int:
+    """Validate the Canvas token and survey what a real run would process.
+
+    Returns 0 if everything looks good, non-zero if a problem was found.
+    """
+    print(f"Canvas base URL: {canvas.base_url}")
+
+    try:
+        me = canvas.get_self()
+    except CanvasError as e:
+        print(f"FAIL: token check failed -- {e}")
+        return 2
+    print(f"Token belongs to: {me.get('name')} (id={me.get('id')}, email={me.get('primary_email')})")
+
+    try:
+        assignment = canvas.get_assignment(args.course, args.assignment)
+    except CanvasError as e:
+        print(f"FAIL: cannot fetch assignment {args.course}/{args.assignment} -- {e}")
+        return 3
+    print(f"Assignment: '{assignment.get('name')}' (id={assignment.get('id')})")
+    if assignment.get('due_at'):
+        print(f"  Due: {assignment.get('due_at')}")
+    print(f"  Submission types: {assignment.get('submission_types')}")
+
+    try:
+        submissions = canvas.list_submissions(args.course, args.assignment)
+    except CanvasError as e:
+        print(f"FAIL: cannot list submissions -- {e}")
+        return 4
+
+    has_attach, pdf_attach, already_done, no_attach = 0, 0, 0, 0
+    for sub in submissions:
+        if not sub.get('attachments'):
+            no_attach += 1
+            continue
+        has_attach += 1
+        if CanvasClient.pdf_attachment(sub):
+            pdf_attach += 1
+        if already_assessed(sub):
+            already_done += 1
+
+    print(f"\nSubmissions found: {len(submissions)}")
+    print(f"  with attachments: {has_attach}")
+    print(f"  with PDF attachment: {pdf_attach}")
+    print(f"  already assessed (will skip unless --rescore): {already_done}")
+    print(f"  no attachment (will skip): {no_attach}")
+    will_process = pdf_attach - already_done
+    if args.rescore:
+        will_process = pdf_attach
+    if args.limit is not None:
+        will_process = min(will_process, args.limit)
+    print(f"\nA real run with these flags would process: {will_process} submissions")
     return 0
 
 
