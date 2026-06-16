@@ -49,3 +49,8 @@ temp/
 
 # Per-assignment corpus (SQLite + FAISS) — generated data, never source
 corpus/
+
+# Local demo / scratch
+demo/
+.demo_*.py
+.commit_msg.tmp

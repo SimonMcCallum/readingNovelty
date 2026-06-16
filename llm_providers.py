@@ -208,13 +208,16 @@ class OllamaProvider(LLMProvider):
     def generate_prompt(self, chunk: str, context_before: str = "",
                         context_after: str = "") -> str:
         client = self._get_client()
+        # max_tokens=600 so gemma-style thinking models can emit visible
+        # output after their internal reasoning budget. Llama, Qwen and other
+        # non-thinking models will stop naturally well before this cap.
         response = client.chat.completions.create(
             model=self.model,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": _build_user_message(chunk, context_before, context_after)}
             ],
-            max_tokens=200,
+            max_tokens=600,
             temperature=0.7,
             timeout=self.timeout
         )
@@ -223,6 +226,7 @@ class OllamaProvider(LLMProvider):
     def predict_chunk(self, context_before: str, context_after: str,
                       hint: str, target_length_words: int = 150) -> str:
         client = self._get_client()
+        # See note on generate_prompt above re thinking-model headroom.
         response = client.chat.completions.create(
             model=self.model,
             messages=[
@@ -231,7 +235,7 @@ class OllamaProvider(LLMProvider):
                     context_before, context_after, hint, target_length_words
                 )},
             ],
-            max_tokens=max(400, target_length_words * 4),
+            max_tokens=max(800, target_length_words * 6),
             temperature=0.5,
             timeout=self.timeout,
         )
@@ -350,13 +354,17 @@ def discover_providers() -> dict:
     if ollama_host:
         ollama_port = int(os.getenv('OLLAMA_PORT', '11434'))
         ollama_model = os.getenv('OLLAMA_MODEL', 'llama3.2')
+        ollama_timeout = int(os.getenv('OLLAMA_TIMEOUT', '60'))
         base_url = f"http://{ollama_host}:{ollama_port}/v1"
         provider = OllamaProvider(
             base_url=base_url, model=ollama_model,
-            name='ollama-local', timeout=60
+            name='ollama-local', timeout=ollama_timeout
         )
         providers['ollama-local'] = provider
-        logger.info(f"Discovered Ollama local provider at {base_url}")
+        logger.info(
+            "Discovered Ollama local provider at %s (model=%s, timeout=%ds)",
+            base_url, ollama_model, ollama_timeout,
+        )
 
     # Cloud and remote providers — skipped entirely when LOCAL_ONLY is set
     if local_only:
