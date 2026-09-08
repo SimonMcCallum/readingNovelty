@@ -54,3 +54,6 @@ corpus/
 demo/
 .demo_*.py
 .commit_msg.tmp
+
+# pytest
+.pytest_cache/

@@ -169,6 +169,42 @@ class TestAssignmentEndpoints(unittest.TestCase):
             self.assertAlmostEqual(entry['novelty_score'], 1.0, places=5)
         self.assertIn('/download/', body['download_url'])
 
+    def test_default_submission_id_yields_downloadable_annotated_pdf(self):
+        """Default submission_id is '<assignment>:<file>'. The ':' must not leak
+        into the on-disk name (Windows alternate data stream; and the download
+        route strips it), and the reader view must link to the same name."""
+        self.client.post('/assignments', json={'assignment_id': 'asg-sub-colon'})
+        pdf = _build_pdf_bytes(['Photosynthesis converts light into chemical energy. ' * 6])
+        resp = self.client.post(
+            '/assignments/asg-sub-colon/submissions',
+            data={'file': (BytesIO(pdf), 'bob.pdf'), 'student_id': 'bob'},
+            content_type='multipart/form-data',
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertEqual(body['submission']['submission_id'], 'asg-sub-colon:bob.pdf')
+        download_url = body['download_url']
+        self.assertNotIn(':', download_url.rsplit('/', 1)[-1])
+
+        dl = self.client.get(download_url)
+        self.assertEqual(dl.status_code, 200, download_url)
+        self.assertTrue(dl.data.startswith(b'%PDF'))
+
+        reader = self.client.get('/assignments/asg-sub-colon/reader')
+        self.assertEqual(reader.status_code, 200)
+        self.assertIn(download_url.encode('utf-8'), reader.data)
+
+    def test_health_and_providers_report_embedding_model(self):
+        health = self.client.get('/health').get_json()
+        self.assertEqual(health['embedding_model'],
+                         self.server.novelty_detector.embedding_model_name)
+        self.assertEqual(health['embedding_dim'], self.server.novelty_detector.embedding_dim)
+        providers = self.client.get('/providers').get_json()
+        self.assertEqual(providers['embedding_model'], health['embedding_model'])
+        self.assertIn('trusted_hosts', providers)
+        self.assertIn('fallback', providers['providers'])
+        self.assertIn('leaves_host', providers['providers']['fallback'])
+
     def test_second_submission_scored_against_first(self):
         self.client.post('/assignments', json={'assignment_id': 'asg-sub-5'})
         same_text = ['Quantum entanglement underpins cryptography. ' * 6]

@@ -212,7 +212,8 @@ def main(argv=None) -> int:
 
     detector = NoveltyDetector()
     processor = PDFProcessor()
-    corpus = CorpusStore(args.corpus_dir, embedding_dim=detector.embedding_dim)
+    corpus = CorpusStore(args.corpus_dir, embedding_dim=detector.embedding_dim,
+                         embedding_model=detector.embedding_model_name)
     corpus.ensure_assignment(args.corpus_id, name=f"Read folder: {args.read_folder}")
 
     ingest_report = ingest_folder(

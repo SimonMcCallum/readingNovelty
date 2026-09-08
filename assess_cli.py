@@ -219,7 +219,8 @@ def main(argv=None) -> int:
         )
 
     processor = PDFProcessor()
-    corpus = CorpusStore(args.corpus_dir, embedding_dim=detector.embedding_dim)
+    corpus = CorpusStore(args.corpus_dir, embedding_dim=detector.embedding_dim,
+                         embedding_model=detector.embedding_model_name)
     corpus.ensure_assignment(args.internal_id, name=f"Canvas {args.course}/{args.assignment}")
 
     try:

@@ -2,39 +2,116 @@
 Novelty Detection Module
 
 Uses LLMs and FAISS embeddings to detect novelty in text chunks.
+
+Embedding model selection
+-------------------------
+The sentence-embedding model is chosen, in order, from the constructor
+argument, the EMBEDDING_MODEL environment variable, then the default
+(all-MiniLM-L6-v2). Embeddings are always L2-normalised before they are
+indexed or compared, so the squared-L2 distances FAISS returns are
+2 - 2*cosine regardless of which model produced them. Without that step a
+model that does not normalise its output (e.g. the e5 family) would push
+every distance far above the novelty scale and saturate scores at 1.0.
+
+Use `python embedding_models_cli.py list` to pull a current ranking of
+similarity models from Hugging Face and `... check <model>` to verify one
+loads locally before pointing EMBEDDING_MODEL at it.
 """
 
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional, Tuple
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
 
-from llm_providers import LLMProvider, FallbackProvider, discover_providers
+from llm_providers import (
+    LLMProvider, FallbackProvider, discover_providers, select_active_provider,
+)
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_EMBEDDING_MODEL = 'all-MiniLM-L6-v2'
+_TRUTHY = ('1', 'true', 'yes', 'on')
+
+
+def resolve_embedding_model_name(explicit: Optional[str] = None) -> str:
+    """Constructor argument > EMBEDDING_MODEL env var > project default."""
+    return explicit or os.getenv('EMBEDDING_MODEL') or DEFAULT_EMBEDDING_MODEL
+
+
+class Embedder:
+    """Thin wrapper around SentenceTransformer that always normalises output.
+
+    Exposes the two methods the rest of the code base relies on
+    (`encode(texts, show_progress_bar=False)` and
+    `get_sentence_embedding_dimension()`), so anything that accepted a raw
+    SentenceTransformer keeps working.
+    """
+
+    def __init__(self, model_name: str, device: Optional[str] = None,
+                 trust_remote_code: Optional[bool] = None):
+        if trust_remote_code is None:
+            trust_remote_code = os.getenv('EMBEDDING_TRUST_REMOTE_CODE', '0').lower() in _TRUTHY
+        device = device or os.getenv('EMBEDDING_DEVICE') or None
+        kwargs = {}
+        if device:
+            kwargs['device'] = device
+        if trust_remote_code:
+            kwargs['trust_remote_code'] = True
+        self.name = model_name
+        self.model = SentenceTransformer(model_name, **kwargs)
+        self.batch_size = int(os.getenv('EMBEDDING_BATCH_SIZE', '32'))
+        logger.info(
+            "Embedding model: %s (dim=%d, max_seq_length=%s)",
+            model_name, self.get_sentence_embedding_dimension(),
+            getattr(self.model, 'max_seq_length', '?'),
+        )
+
+    def encode(self, texts: List[str], show_progress_bar: bool = False) -> np.ndarray:
+        return np.asarray(self.model.encode(
+            list(texts), show_progress_bar=show_progress_bar,
+            batch_size=self.batch_size, normalize_embeddings=True,
+            convert_to_numpy=True,
+        ), dtype='float32')
+
+    def get_sentence_embedding_dimension(self) -> int:
+        # sentence-transformers >= 5 renamed this; keep the old name as our API.
+        getter = getattr(self.model, 'get_embedding_dimension', None) \
+            or self.model.get_sentence_embedding_dimension
+        return int(getter())
+
+    @property
+    def max_seq_length(self):
+        return getattr(self.model, 'max_seq_length', None)
 
 
 class NoveltyDetector:
     """Detects novelty in text using LLM and FAISS embeddings."""
 
-    def __init__(self, embedding_model='all-MiniLM-L6-v2', provider: Optional[LLMProvider] = None):
+    def __init__(self, embedding_model: Optional[str] = None,
+                 provider: Optional[LLMProvider] = None):
         """
         Initialize novelty detector.
 
         Args:
-            embedding_model: Name of sentence transformer model to use
-            provider: Optional specific LLM provider to use. If None, auto-discovers from env.
+            embedding_model: Sentence-transformers model id. None means use
+                EMBEDDING_MODEL from the environment, else all-MiniLM-L6-v2.
+            provider: Optional specific LLM provider to use. If None,
+                discovers from env and picks the first reachable one
+                (LLM_PROVIDER overrides).
         """
-        self.embedding_model = SentenceTransformer(embedding_model)
+        self.embedding_model_name = resolve_embedding_model_name(embedding_model)
+        self.embedding_model = Embedder(self.embedding_model_name)
         self.providers = discover_providers()
 
         if provider:
             self.active_provider = provider
         else:
-            # Use first available provider (priority order from discover_providers)
-            self.active_provider = next(iter(self.providers.values()))
+            self.active_provider = select_active_provider(
+                self.providers, preferred=os.getenv('LLM_PROVIDER') or None,
+            )
 
         # Backwards compatibility
         self.llm_type = self.active_provider.name
@@ -131,7 +208,6 @@ class NoveltyDetector:
             texts = [chunk['text'] for chunk in chunks]
             logger.info("Generating embeddings...")
             embeddings = self.embedding_model.encode(texts, show_progress_bar=False)
-            embeddings = np.array(embeddings)
 
             novelty_scores = []
 
@@ -258,9 +334,7 @@ class NoveltyDetector:
             )
 
         actual_texts = [c['text'] for c in chunks]
-        actual_embeddings = np.asarray(
-            self.embedding_model.encode(actual_texts, show_progress_bar=False)
-        )
+        actual_embeddings = self.embedding_model.encode(actual_texts, show_progress_bar=False)
 
         def predict_one(idx_chunk: Tuple[int, Dict]) -> str:
             i, chunk = idx_chunk
@@ -282,9 +356,7 @@ class NoveltyDetector:
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 predictions = list(pool.map(predict_one, enumerate(chunks)))
 
-        predicted_embeddings = np.asarray(
-            self.embedding_model.encode(predictions, show_progress_bar=False)
-        )
+        predicted_embeddings = self.embedding_model.encode(predictions, show_progress_bar=False)
 
         scores: List[float] = []
         for actual_emb, pred_emb in zip(actual_embeddings, predicted_embeddings):

@@ -212,7 +212,8 @@ def main(argv=None) -> int:
     # prompt-generation path in citation-graph mode (LLM provider not needed
     # for this signal), so the active provider doesn't matter here.
     detector = NoveltyDetector()
-    corpus = CorpusStore(args.corpus_dir, embedding_dim=detector.embedding_dim)
+    corpus = CorpusStore(args.corpus_dir, embedding_dim=detector.embedding_dim,
+                         embedding_model=detector.embedding_model_name)
     fetcher = SemanticScholarClient(
         cache_dir=args.cache_dir, rate_limit_seconds=args.rate_limit
     )

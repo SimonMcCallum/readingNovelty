@@ -12,8 +12,8 @@ from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 from pdf_processor import PDFProcessor
 from novelty_detector import NoveltyDetector
-from llm_providers import discover_providers, _local_only_enabled
-from corpus import CorpusStore
+from llm_providers import discover_providers, _local_only_enabled, _trusted_hosts
+from corpus import CorpusStore, EmbeddingModelMismatch
 
 # Load environment variables
 load_dotenv()
@@ -35,7 +35,10 @@ pdf_processor = PDFProcessor()
 novelty_detector = NoveltyDetector()
 
 CORPUS_DIR = os.getenv('CORPUS_DIR', 'corpus')
-corpus_store = CorpusStore(CORPUS_DIR, embedding_dim=novelty_detector.embedding_dim)
+corpus_store = CorpusStore(
+    CORPUS_DIR, embedding_dim=novelty_detector.embedding_dim,
+    embedding_model=novelty_detector.embedding_model_name,
+)
 
 LOCAL_ONLY = _local_only_enabled()
 
@@ -44,12 +47,16 @@ def _log_privacy_banner():
     """Log the active privacy posture and provider so it is obvious in startup logs."""
     active = novelty_detector.active_provider.name
     if LOCAL_ONLY:
-        logger.info("PRIVACY: LOCAL_ONLY=1 — cloud and remote providers disabled.")
+        trusted = sorted(_trusted_hosts())
+        logger.info("PRIVACY: LOCAL_ONLY=1 — cloud and remote providers disabled%s.",
+                    f"; trusted hosts: {', '.join(trusted)}" if trusted else "")
     else:
         logger.warning(
             "PRIVACY: LOCAL_ONLY=0 — cloud providers may process submissions. "
             "Do not use for copyrighted content."
         )
+    logger.info("Embedding model: %s (dim=%d, on this host)",
+                novelty_detector.embedding_model_name, novelty_detector.embedding_dim)
     logger.info("Active provider: %s", active)
     if active == 'fallback':
         logger.warning(
@@ -76,6 +83,17 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
+def annotated_pdf_name(submission_id: str, filename: str) -> str:
+    """On-disk name of a submission's annotated PDF.
+
+    The default submission_id is "<assignment>:<file>". A raw ':' in a path
+    is an alternate data stream on Windows and the download route strips it
+    via secure_filename anyway, so sanitise once here and use the same name
+    everywhere (write, JSON download_url, reader view link).
+    """
+    return secure_filename(f"annotated_{submission_id}_{filename}")
+
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint. Reports privacy posture and assessment readiness."""
@@ -85,25 +103,42 @@ def health_check():
         'local_only': LOCAL_ONLY,
         'active_provider': novelty_detector.active_provider.name,
         'assessment_ready': _assessment_provider_ready(),
+        'embedding_model': novelty_detector.embedding_model_name,
+        'embedding_dim': novelty_detector.embedding_dim,
     })
 
 
 @app.route('/providers', methods=['GET'])
 def list_providers():
-    """List available LLM providers and their status."""
+    """List available LLM providers and their status.
+
+    Pass ?models=1 to also list the model ids each reachable provider serves
+    (one extra HTTP call per provider).
+    """
+    want_models = request.args.get('models', '0').lower() in ('1', 'true', 'yes')
     providers_info = {}
     for name, provider in novelty_detector.providers.items():
+        available = provider.is_available()
         providers_info[name] = {
             'name': name,
-            'available': provider.is_available(),
+            'available': available,
             'active': name == novelty_detector.active_provider.name,
+            'leaves_host': bool(getattr(provider, 'is_cloud', False)),
+            'trusted': bool(getattr(provider, 'trusted', True)),
         }
-        if hasattr(provider, 'model'):
-            providers_info[name]['model'] = provider.model
+        # Read the configured value without triggering lazy auto-resolution.
+        model = getattr(provider, '_model', None) if hasattr(provider, '_model') \
+            else getattr(provider, 'model', None)
+        if model is not None:
+            providers_info[name]['model'] = model
         if hasattr(provider, 'base_url'):
             providers_info[name]['base_url'] = provider.base_url
+        if want_models and available:
+            providers_info[name]['models'] = provider.list_models()
     return jsonify({
         'local_only': LOCAL_ONLY,
+        'trusted_hosts': sorted(_trusted_hosts()),
+        'embedding_model': novelty_detector.embedding_model_name,
         'providers': providers_info,
     }), 200
 
@@ -224,7 +259,7 @@ def submit_to_assignment(assignment_id):
             novelty_scores=novelty_scores,
         )
 
-        annotated_filename = f"annotated_{submission_id}_{filename}"
+        annotated_filename = annotated_pdf_name(submission_id, filename)
         annotated_filepath = os.path.join(app.config['UPLOAD_FOLDER'], annotated_filename)
         pdf_processor.create_annotated_pdf(filepath, chunks, novelty_scores, annotated_filepath)
 
@@ -243,6 +278,13 @@ def submit_to_assignment(assignment_id):
             'corpus_priors': corpus_store.get_assignment(assignment_id)['chunk_count'] - len(chunks),
         }), 200
 
+    except EmbeddingModelMismatch as e:
+        logger.error("Embedding model mismatch: %s", e)
+        return jsonify({
+            'error': 'Corpus was built with a different embedding model.',
+            'detail': str(e),
+            'fix': f'POST /assignments/{assignment_id}/rebuild_index, or use a fresh CORPUS_DIR.',
+        }), 409
     except Exception as e:
         logger.error(f"Error processing submission: {e}", exc_info=True)
         return jsonify({'error': 'Error processing submission.'}), 500
@@ -255,7 +297,8 @@ def rebuild_index(assignment_id):
     if corpus_store.get_assignment(assignment_id) is None:
         return jsonify({'error': 'Assignment not found'}), 404
     report = corpus_store.rebuild_index(
-        assignment_id, novelty_detector.embedding_model
+        assignment_id, novelty_detector.embedding_model,
+        model_name=novelty_detector.embedding_model_name,
     )
     logger.info(
         "Rebuilt index for %s: %d before, %d after, %d orphans removed",
@@ -321,7 +364,7 @@ READER_TEMPLATE = """<!doctype html>
    {% elif sc >= 0.2 %}<span class="score s-low">{{ '%.2f'|format(sc) }}</span>
    {% else %}<span class="score s-vlow">{{ '%.2f'|format(sc) }}</span>{% endif %}
   </td>
-  <td><a href="/download/annotated_{{ s.submission_id }}_{{ s.filename }}">annotated</a></td>
+  <td><a href="/download/{{ s.annotated_filename }}">annotated</a></td>
  </tr>
  {% endfor %}
 </table>
@@ -339,6 +382,8 @@ def reader_view(assignment_id):
     if assignment is None:
         return jsonify({'error': 'Assignment not found'}), 404
     submissions = corpus_store.list_submissions(assignment_id)
+    for s in submissions:
+        s['annotated_filename'] = annotated_pdf_name(s['submission_id'], s['filename'] or '')
     return render_template_string(
         READER_TEMPLATE, assignment=assignment, submissions=submissions
     )

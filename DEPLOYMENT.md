@@ -72,9 +72,16 @@
 
 ### Environment Variables
 
-Required environment variables:
-- `ANTHROPIC_API_KEY` - Your Anthropic API key (for Claude)
-- OR `OPENAI_API_KEY` - Your OpenAI API key (for ChatGPT)
+One LLM endpoint is required (see the README configuration reference for
+the full list):
+- `OLLAMA_HOST` / `OLLAMA_PORT` / `OLLAMA_MODEL` - Ollama on the host, or
+- `OPENWEBUI_URL` + `OPENWEBUI_API_KEY` (+ `TRUSTED_LLM_HOSTS`) - an
+  institutional Open WebUI such as `https://openwebui.ecs.vuw.ac.nz`, or
+- `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` - cloud, only
+  honoured with `LOCAL_ONLY=0`.
+
+Embeddings always run on the host; choose the model with
+`EMBEDDING_MODEL` (`python embedding_models_cli.py list` ranks candidates).
 
 Optional:
 - `FLASK_ENV` - Environment (development/production)

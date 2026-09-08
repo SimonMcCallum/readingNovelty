@@ -199,5 +199,84 @@ class TestRebuildIndex(unittest.TestCase):
         self.assertEqual(report['embeddings_recomputed'], 0)
 
 
+class TestEmbeddingModelTracking(unittest.TestCase):
+    """Changing EMBEDDING_MODEL must never silently mix vectors in one index."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='corpus_model_')
+        self.chunks = [{'text': 'a', 'prompt': 'a'}, {'text': 'b', 'prompt': 'b'}]
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _add(self, store, sid='s1'):
+        store.add_submission('asg', sid, None, 'f.pdf', self.chunks,
+                             _matrix([1, 2], dim=store.embedding_dim), [1.0, 1.0])
+
+    def test_model_recorded_on_first_add(self):
+        store = CorpusStore(self.tmp, embedding_dim=16, embedding_model='model-A')
+        self._add(store)
+        self.assertEqual(store.get_assignment('asg')['embedding_model'], 'model-A')
+
+    def test_same_model_reopens_fine(self):
+        store = CorpusStore(self.tmp, embedding_dim=16, embedding_model='model-A')
+        self._add(store)
+        again = CorpusStore(self.tmp, embedding_dim=16, embedding_model='model-A')
+        self._add(again, sid='s2')
+        self.assertEqual(again.get_assignment('asg')['submission_count'], 2)
+
+    def test_different_model_same_dim_refused(self):
+        from corpus import EmbeddingModelMismatch
+        store = CorpusStore(self.tmp, embedding_dim=16, embedding_model='model-A')
+        self._add(store)
+        other = CorpusStore(self.tmp, embedding_dim=16, embedding_model='model-B')
+        with self.assertRaises(EmbeddingModelMismatch):
+            self._add(other, sid='s2')
+
+    def test_different_dim_refused_on_load(self):
+        from corpus import EmbeddingModelMismatch
+        store = CorpusStore(self.tmp, embedding_dim=16, embedding_model='model-A')
+        self._add(store)
+        other = CorpusStore(self.tmp, embedding_dim=32, embedding_model='model-B')
+        with self.assertRaises(EmbeddingModelMismatch):
+            other.score_against_corpus('asg', _matrix([1], dim=32))
+
+    def test_wrong_width_embeddings_rejected(self):
+        store = CorpusStore(self.tmp, embedding_dim=16, embedding_model='model-A')
+        with self.assertRaises(ValueError):
+            store.add_submission('asg', 's1', None, 'f.pdf', self.chunks,
+                                 _matrix([1, 2], dim=8), [1.0, 1.0])
+
+    def test_rebuild_migrates_to_new_model(self):
+        store = CorpusStore(self.tmp, embedding_dim=16, embedding_model='model-A')
+        self._add(store)
+        new = CorpusStore(self.tmp, embedding_dim=16, embedding_model='model-B')
+        report = new.rebuild_index('asg', _StubEmbeddingModel())
+        self.assertEqual(report['rows_after'], 2)
+        self.assertEqual(new.get_assignment('asg')['embedding_model'], 'model-B')
+        self._add(new, sid='s2')  # accepted now
+
+    def test_legacy_db_without_column_is_migrated(self):
+        import sqlite3
+        db = os.path.join(self.tmp, 'corpus.db')
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE assignments (assignment_id TEXT PRIMARY KEY, name TEXT, "
+                     "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, chunk_count INTEGER DEFAULT 0)")
+        conn.execute("INSERT INTO assignments(assignment_id, name) VALUES ('old', 'Old')")
+        conn.commit()
+        conn.close()
+        store = CorpusStore(self.tmp, embedding_dim=16, embedding_model='model-A')
+        info = store.get_assignment('old')
+        self.assertIsNone(info['embedding_model'])
+        store.add_submission('old', 's1', None, 'f.pdf', self.chunks,
+                             _matrix([1, 2]), [1.0, 1.0])
+        self.assertEqual(store.get_assignment('old')['embedding_model'], 'model-A')
+
+    def test_no_model_name_means_no_enforcement(self):
+        store = CorpusStore(self.tmp, embedding_dim=16)
+        self._add(store)
+        self.assertIsNone(store.get_assignment('asg')['embedding_model'])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS assignments (
     assignment_id TEXT PRIMARY KEY,
     name TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    chunk_count INTEGER DEFAULT 0
+    chunk_count INTEGER DEFAULT 0,
+    embedding_model TEXT
 );
 
 CREATE TABLE IF NOT EXISTS submissions (
@@ -60,12 +61,29 @@ CREATE INDEX IF NOT EXISTS idx_submissions_assignment ON submissions(assignment_
 """
 
 
-class CorpusStore:
-    """SQLite + FAISS corpus, one index per assignment."""
+class EmbeddingModelMismatch(RuntimeError):
+    """The corpus on disk was built with a different embedding model.
 
-    def __init__(self, corpus_dir: str, embedding_dim: int):
+    Vectors from two models are not comparable, and usually not even the same
+    dimension. Rebuild the partition (`rebuild_index`) with the current model,
+    point CORPUS_DIR at a fresh directory, or switch EMBEDDING_MODEL back.
+    """
+
+
+class CorpusStore:
+    """SQLite + FAISS corpus, one index per assignment.
+
+    `embedding_model` is the name of the sentence-embedding model that
+    produced the vectors. It is recorded per assignment the first time
+    vectors are added and enforced afterwards, so a change of EMBEDDING_MODEL
+    cannot silently mix incomparable vectors in one index.
+    """
+
+    def __init__(self, corpus_dir: str, embedding_dim: int,
+                 embedding_model: Optional[str] = None):
         self.corpus_dir = corpus_dir
         self.embedding_dim = embedding_dim
+        self.embedding_model = embedding_model
         os.makedirs(corpus_dir, exist_ok=True)
         self.db_path = os.path.join(corpus_dir, 'corpus.db')
         self._index_cache: Dict[str, faiss.Index] = {}
@@ -75,6 +93,31 @@ class CorpusStore:
     def _init_db(self):
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            # Migration for corpora created before embedding_model was tracked.
+            cols = {r['name'] for r in conn.execute("PRAGMA table_info(assignments)")}
+            if 'embedding_model' not in cols:
+                conn.execute("ALTER TABLE assignments ADD COLUMN embedding_model TEXT")
+
+    def _check_embedding_model(self, conn, assignment_id: str):
+        """Record the embedding model on first use; refuse a different one later."""
+        if not self.embedding_model:
+            return
+        row = conn.execute(
+            "SELECT embedding_model FROM assignments WHERE assignment_id = ?",
+            (assignment_id,),
+        ).fetchone()
+        stored = row['embedding_model'] if row else None
+        if stored is None:
+            conn.execute(
+                "UPDATE assignments SET embedding_model = ? WHERE assignment_id = ?",
+                (self.embedding_model, assignment_id),
+            )
+        elif stored != self.embedding_model:
+            raise EmbeddingModelMismatch(
+                f"Assignment {assignment_id!r} was embedded with {stored!r} but the "
+                f"current embedding model is {self.embedding_model!r}. Rebuild the "
+                "index with the new model or use a different CORPUS_DIR."
+            )
 
     @contextmanager
     def _connect(self):
@@ -105,6 +148,13 @@ class CorpusStore:
         path = self._index_path(assignment_id)
         if os.path.exists(path):
             index = faiss.read_index(path)
+            if index.d != self.embedding_dim:
+                raise EmbeddingModelMismatch(
+                    f"FAISS index for {assignment_id!r} has dimension {index.d} but the "
+                    f"current embedding model produces {self.embedding_dim}. The corpus was "
+                    "built with a different EMBEDDING_MODEL; rebuild it or use a fresh "
+                    "CORPUS_DIR."
+                )
         else:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             index = faiss.IndexFlatL2(self.embedding_dim)
@@ -211,9 +261,16 @@ class CorpusStore:
         """
         if len(chunks) != len(embeddings) or len(chunks) != len(novelty_scores):
             raise ValueError("chunks, embeddings and novelty_scores length mismatch")
+        embeddings = np.asarray(embeddings, dtype='float32')
+        if embeddings.ndim != 2 or embeddings.shape[1] != self.embedding_dim:
+            raise ValueError(
+                f"embeddings must have shape (n, {self.embedding_dim}); got {embeddings.shape}"
+            )
 
         with self._lock:
             self.ensure_assignment(assignment_id)
+            with self._connect() as conn:
+                self._check_embedding_model(conn, assignment_id)
             index = self._load_index(assignment_id)
             start_row = index.ntotal
             index.add(np.asarray(embeddings, dtype='float32'))
@@ -259,7 +316,7 @@ class CorpusStore:
     def get_assignment(self, assignment_id: str) -> Optional[Dict]:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT assignment_id, name, created_at, chunk_count "
+                "SELECT assignment_id, name, created_at, chunk_count, embedding_model "
                 "FROM assignments WHERE assignment_id = ?",
                 (assignment_id,),
             ).fetchone()
@@ -275,6 +332,7 @@ class CorpusStore:
                 'created_at': row['created_at'],
                 'chunk_count': row['chunk_count'],
                 'submission_count': sub_count,
+                'embedding_model': row['embedding_model'],
             }
 
     def list_submissions(self, assignment_id: str) -> List[Dict]:
@@ -315,7 +373,8 @@ class CorpusStore:
             result['chunks'] = [dict(c) for c in chunks]
             return result
 
-    def rebuild_index(self, assignment_id: str, embedding_model) -> Dict:
+    def rebuild_index(self, assignment_id: str, embedding_model,
+                      model_name: Optional[str] = None) -> Dict:
         """
         Rebuild the FAISS index for an assignment from the chunks currently
         in SQLite, dropping any orphan rows left behind by re-uploads.
@@ -325,12 +384,16 @@ class CorpusStore:
             its text (read-folder / citation-graph mode where prompt='').
           - Build a fresh IndexFlatL2 in chunk_id order.
           - Update embedding_row in SQLite so scoring still aligns.
+          - Record `model_name` (default: this store's embedding_model) as the
+            assignment's embedding model, so this is also the migration path
+            after changing EMBEDDING_MODEL.
           - Persist the new index to disk.
 
-        Use after heavy resubmission cycles. Not needed for normal operation.
+        Use after heavy resubmission cycles or an embedding-model change.
 
         Returns counts: rows_before, rows_after, orphans_removed, embeddings_recomputed.
         """
+        model_name = model_name or self.embedding_model
         with self._lock:
             cached = self._index_cache.pop(assignment_id, None)
             rows_before = cached.ntotal if cached is not None else (
@@ -374,7 +437,13 @@ class CorpusStore:
                     "UPDATE assignments SET chunk_count = ? WHERE assignment_id = ?",
                     (len(rows), assignment_id),
                 )
+                if model_name:
+                    conn.execute(
+                        "UPDATE assignments SET embedding_model = ? WHERE assignment_id = ?",
+                        (model_name, assignment_id),
+                    )
 
+            self.embedding_dim = dim
             self._index_cache[assignment_id] = fresh
             self._persist_index(assignment_id)
 
